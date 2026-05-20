@@ -41,6 +41,10 @@ class ChangeRegion:
     """A bounding box around a region of detected change. Pixel coords
     in the v1 image frame (which is also the aligned-v2 frame).
 
+    `x, y, w, h` is the padded bounding box (includes box_margin_px) — what
+    we draw as the outer outline.
+    `core_x, core_y, core_w, core_h` is the actual extent of the change
+    before padding — used for the highlighter layer in layered markup mode.
     `stroke_width` and `is_foreground` are populated by the classify
     stage. They have defaults so older callers that don't classify still
     get sensible behavior — unclassified regions are treated as foreground."""
@@ -49,6 +53,10 @@ class ChangeRegion:
     w: int
     h: int
     area: int  # number of changed pixels inside the box (not box area)
+    core_x: int = 0   # un-padded change extent (defaults to padded if not set)
+    core_y: int = 0
+    core_w: int = 0
+    core_h: int = 0
     stroke_width: float = 0.0  # typical stroke width of changed pixels (px); 0 = unmeasured
     is_foreground: bool = True  # False = thin/background, True = thick/MEP-work or unclassified
 
@@ -114,6 +122,10 @@ def detect_changes(
             w=x2_pad - x_pad,
             h=y2_pad - y_pad,
             area=int(area),
+            core_x=int(x),
+            core_y=int(y),
+            core_w=int(ww),
+            core_h=int(hh),
             stroke_width=stroke.width,
             # is_foreground defaults True; classify.classify_regions() sets it properly.
         ))
