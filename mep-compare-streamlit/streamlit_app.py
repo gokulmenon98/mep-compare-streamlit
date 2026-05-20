@@ -25,6 +25,7 @@ from mep_compare.classify import auto_threshold, classify_regions
 from mep_compare.annotate import (
     annotate_page, save_annotated,
     BACKGROUND_MODE_DEEMPHASIZE, BACKGROUND_MODE_HIDE,
+    MARKUP_MODE_BOXES, MARKUP_MODE_LAYERED,
 )
 
 # ─── Page config ──────────────────────────────────────────────────────
@@ -415,12 +416,41 @@ with st.expander("Title block region — where the drawing number sits on each s
     title_block = (tb_x1, tb_y1, tb_x2, tb_y2)
 
 with st.expander("Detection sensitivity"):
+    sensitivity = st.select_slider(
+        "Foreground/background sensitivity",
+        options=[
+            "1 — Strict (thick only)",
+            "2 — Less sensitive",
+            "3 — Default",
+            "4 — More sensitive",
+            "5 — Generous (almost everything)",
+        ],
+        value="3 — Default",
+        help=(
+            "Where to draw the line between MEP work (bold magenta) and architectural "
+            "background (grey dashed). Strict catches only thick MEP linework. Generous "
+            "treats most changes as foreground. Default uses an auto-calibrated value "
+            "per drawing set."
+        ),
+    )
+    # Map slider to a multiplier on the auto-calibrated threshold.
+    # Higher multiplier → higher threshold → fewer foreground.
+    SENSITIVITY_MULTIPLIER = {
+        "1 — Strict (thick only)":      2.0,
+        "2 — Less sensitive":           1.4,
+        "3 — Default":                  1.0,
+        "4 — More sensitive":           0.7,
+        "5 — Generous (almost everything)": 0.5,
+    }
+    sensitivity_mult = SENSITIVITY_MULTIPLIER[sensitivity]
+
+    st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
     s_col1, s_col2, s_col3 = st.columns(3)
-    dpi = s_col1.number_input("DPI", value=150, min_value=72, max_value=300, step=25,
+    dpi = s_col1.number_input("DPI", value=200, min_value=72, max_value=300, step=25,
                               help="Higher = more sensitive but slower and more memory")
     pixel_threshold = s_col2.number_input("Pixel threshold", value=40, min_value=5, max_value=200,
                                           help="Lower = more sensitive to small color differences")
-    dilation_px = s_col3.number_input("Dilation (px)", value=15, min_value=1, max_value=40,
+    dilation_px = s_col3.number_input("Dilation (px)", value=12, min_value=1, max_value=40,
                                       help="How aggressively to merge nearby changes")
     min_area_px = st.number_input("Minimum change area (px)", value=200, min_value=20, max_value=5000,
                                   help="Drop tiny specks below this size")
@@ -429,6 +459,21 @@ with st.expander("Detection sensitivity"):
         value=False,
         help="By default these are shown as grey-dashed boxes. Check to suppress them.",
     )
+
+with st.expander("Markup style"):
+    markup_choice = st.radio(
+        "How to mark changes on the V2 PDF",
+        options=["Boxes only", "Layered (halo ring + highlight + box)"],
+        index=0,
+        help=(
+            "Boxes only: thin magenta outline around each change cluster. Clean, "
+            "matches the standard AEC bounding-box review convention. Best for scanning. "
+            "Layered: adds a thick faded outer ring (halo) for peripheral visibility, "
+            "plus a medium ring on the precise change area. The underlying drawing "
+            "stays visible through all layers."
+        ),
+    )
+    markup_mode = MARKUP_MODE_LAYERED if "Layered" in markup_choice else MARKUP_MODE_BOXES
 
 
 # ─── Compare button ───────────────────────────────────────────────────
@@ -510,8 +555,14 @@ if run and v1_file and v2_file:
             st.write("Classifying foreground vs background…")
             all_widths = [r.stroke_width for _, _, regs, _, _, _ in page_results
                           for r in regs if r.stroke_width > 0]
-            threshold = auto_threshold(all_widths) if all_widths else 3.0
-            st.write(f"  Stroke threshold: {threshold:.2f}px  (from {len(all_widths)} regions)")
+            auto = auto_threshold(all_widths) if all_widths else 3.0
+            threshold = auto * sensitivity_mult
+            if sensitivity_mult == 1.0:
+                st.write(f"  Stroke threshold: **{threshold:.2f}px** (auto, from {len(all_widths)} regions)")
+            else:
+                direction = "stricter" if sensitivity_mult > 1.0 else "more generous"
+                st.write(f"  Stroke threshold: **{threshold:.2f}px** "
+                         f"(auto {auto:.2f}px × {sensitivity_mult:.1f} {direction})")
             for _, _, regs, _, _, _ in page_results:
                 classify_regions(regs, threshold)
 
@@ -526,7 +577,8 @@ if run and v1_file and v2_file:
                 v2_page = v2_doc[v2_id.page_index]
                 fg, bg = annotate_page(v2_page, regs, dpi=dpi,
                                        label_prefix=v1_id.drawing_number,
-                                       background_mode=bg_mode)
+                                       background_mode=bg_mode,
+                                       markup_mode=markup_mode)
                 total_fg += fg
                 total_bg += bg
 
