@@ -1,12 +1,15 @@
 """
 MEP Drawing Compare — Streamlit app.
 
-Wraps the mep_compare Python package in a web UI. The user uploads two PDFs;
-the server runs the full identify → match → register → diff → classify →
-annotate pipeline; the user downloads the marked-up V2 PDF.
+Wraps the mep_compare Python package in a web UI. Upload two PDFs,
+server runs the full pipeline (identify → match → register → diff →
+annotate), user downloads the marked-up V2 PDF.
 
-This is the server-side version of the tool. All heavy lifting happens on
-the Streamlit Cloud machine — no browser WASM, no CDN dependencies.
+This version uses directional detection: added content (new ink in V2)
+is marked with a yellow highlighter, removed content (ink that was in
+V1 but is gone from V2) gets a magenta revision cloud. No more
+foreground/background classification — the semantic split does the
+visual hierarchy work directly.
 """
 from __future__ import annotations
 import io
@@ -21,15 +24,9 @@ from mep_compare.identify import identify_all, DEFAULT_CALIBRATION
 from mep_compare.match import match_sheets
 from mep_compare.register import register
 from mep_compare.diff import detect_changes
-from mep_compare.classify import auto_threshold, classify_regions
-from mep_compare.annotate import (
-    annotate_page, save_annotated,
-    BACKGROUND_MODE_DEEMPHASIZE, BACKGROUND_MODE_HIDE,
-    MARKUP_MODE_BOXES, MARKUP_MODE_LAYERED,
-)
+from mep_compare.annotate import annotate_page
 
 # ─── Page config ──────────────────────────────────────────────────────
-# Must be the first Streamlit call.
 st.set_page_config(
     page_title="MEP Drawing Compare",
     page_icon="📐",
@@ -38,9 +35,6 @@ st.set_page_config(
 )
 
 # ─── CSS — schedule extractor design system ───────────────────────────
-# Injected via st.markdown(unsafe_allow_html=True). Targets Streamlit's
-# internal class names where needed (these are stable across recent
-# Streamlit versions but can shift on major releases).
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=DM+Sans:opsz,wght@9..40,300..700&family=JetBrains+Mono:wght@400;500;600&display=swap');
@@ -57,54 +51,42 @@ st.markdown("""
   --serif: 'Fraunces', Georgia, serif;
   --sans: 'DM Sans', system-ui, sans-serif;
   --mono: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
+  --added: #C2A300;     /* darker yellow for UI accents — actual marker is brighter */
+  --removed: #B8311A;
 }
 
-/* Hide Streamlit's default chrome. */
 #MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden; height: 0; }
 [data-testid="stToolbar"] { display: none; }
 
-/* App background — cream with dot grid like the schedule extractor. */
 .stApp {
   background-color: var(--bg);
   background-image: radial-gradient(circle at 1px 1px, rgba(26,24,22,0.08) 1px, transparent 0);
   background-size: 22px 22px;
 }
-
-/* Body text. */
 .stApp, .stMarkdown, p, label, .stTextInput, .stNumberInput {
   font-family: var(--sans);
   color: var(--ink);
 }
-
-/* Container padding: match schedule extractor's max-width 1100px. */
 .block-container {
   padding-top: 1.5rem !important;
   padding-bottom: 3rem !important;
   max-width: 1100px !important;
 }
 
-/* ── Brand header ─────────────────────────────────────────────── */
 .brand-row {
   display: flex;
   align-items: center;
   gap: 18px;
   border-bottom: 1px solid var(--rule);
   padding-bottom: 22px;
-  margin-bottom: 0;
 }
 .brand-mark {
-  width: 42px;
-  height: 42px;
+  width: 42px; height: 42px;
   border: 1.5px solid var(--ink);
   font-family: var(--mono);
-  font-weight: 600;
-  font-size: 13px;
-  letter-spacing: 0.05em;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  color: var(--ink);
+  font-weight: 600; font-size: 13px; letter-spacing: 0.05em;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0; color: var(--ink);
 }
 .brand-title {
   font-family: var(--serif);
@@ -119,22 +101,16 @@ st.markdown("""
 .brand-title .it { font-style: italic; }
 .brand-version {
   font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-3);
+  font-size: 11px; letter-spacing: 0.18em;
+  text-transform: uppercase; color: var(--ink-3);
   line-height: 1.3;
   margin-left: auto;
-  display: flex;
-  flex-direction: column;
+  display: flex; flex-direction: column;
   align-self: flex-start;
   padding-top: 4px;
 }
 
-/* ── Intro strip ──────────────────────────────────────────────── */
-.intro {
-  padding: 40px 0 32px;
-}
+.intro { padding: 40px 0 32px; }
 .intro-paragraph {
   font-family: var(--serif);
   font-size: clamp(22px, 3.4vw, 30px);
@@ -152,11 +128,11 @@ st.markdown("""
   color: var(--ink-3);
   line-height: 2;
 }
+.process .added { color: var(--added); font-weight: 600; }
+.process .removed { color: var(--removed); font-weight: 600; }
 
-/* ── Section heading (step + title) ───────────────────────────── */
 .section-head {
-  display: flex;
-  align-items: baseline;
+  display: flex; align-items: baseline;
   gap: 12px;
   margin: 12px 0 14px;
 }
@@ -179,13 +155,8 @@ st.markdown("""
   color: var(--ink-3);
   margin: 0 0 14px;
 }
-.divider {
-  border: none;
-  border-top: 1.5px dashed var(--ink-4);
-  margin: 0 0 22px;
-}
 
-/* ── File uploader ────────────────────────────────────────────── */
+/* ── File uploader ── */
 [data-testid="stFileUploader"] {
   background: #FFFFFF;
   border: 1px solid var(--ink);
@@ -218,7 +189,6 @@ st.markdown("""
   text-transform: uppercase;
   color: var(--ink-3);
 }
-/* The "Browse files" button inside the dropzone. */
 [data-testid="stBaseButton-secondary"] {
   background: var(--ink) !important;
   color: var(--bg) !important;
@@ -231,12 +201,7 @@ st.markdown("""
   text-transform: uppercase !important;
   padding: 8px 16px !important;
 }
-[data-testid="stBaseButton-secondary"]:hover {
-  background: var(--ink-2) !important;
-  border-color: var(--ink-2) !important;
-}
 
-/* ── Primary button ────────────────────────────────────────────── */
 .stButton > button {
   background: var(--ink) !important;
   color: var(--bg) !important;
@@ -249,27 +214,16 @@ st.markdown("""
   text-transform: uppercase !important;
   padding: 11px 22px !important;
 }
-.stButton > button:hover {
-  background: var(--ink-2) !important;
-  border-color: var(--ink-2) !important;
-}
 .stButton > button:disabled {
   background: var(--ink-4) !important;
   border-color: var(--ink-4) !important;
-  cursor: not-allowed;
 }
-
-/* Download button matches secondary style: cream bg with ink border. */
 [data-testid="stDownloadButton"] > button {
   background: #FFFFFF !important;
   color: var(--ink) !important;
   border: 1px solid var(--ink) !important;
 }
-[data-testid="stDownloadButton"] > button:hover {
-  background: var(--bg) !important;
-}
 
-/* ── Expanders (Advanced settings) ────────────────────────────── */
 .streamlit-expanderHeader, [data-testid="stExpander"] summary {
   font-family: var(--mono) !important;
   font-size: 10px !important;
@@ -283,7 +237,6 @@ st.markdown("""
   background: transparent !important;
 }
 
-/* ── Number inputs / sliders ──────────────────────────────────── */
 [data-testid="stNumberInput"] input,
 [data-testid="stTextInput"] input {
   background: var(--bg) !important;
@@ -300,7 +253,6 @@ st.markdown("""
   color: var(--ink-3) !important;
 }
 
-/* ── Status / progress blocks ──────────────────────────────────── */
 [data-testid="stStatus"], [data-testid="stStatusContainer"] {
   border: 1px solid var(--ink) !important;
   border-radius: 0 !important;
@@ -316,7 +268,6 @@ st.markdown("""
   background: var(--ink) !important;
 }
 
-/* ── Footer strip ─────────────────────────────────────────────── */
 .footer {
   border-top: 1px solid var(--rule);
   margin-top: 40px;
@@ -329,6 +280,45 @@ st.markdown("""
   text-transform: uppercase;
   color: var(--ink-3);
 }
+
+/* ── Legend chips ── */
+.legend {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin: 0 0 28px;
+  flex-wrap: wrap;
+}
+.legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--ink-2);
+}
+.legend-swatch {
+  width: 24px;
+  height: 14px;
+  border: 1px solid var(--ink);
+  display: inline-block;
+}
+.legend-swatch.added {
+  background: rgba(255, 232, 0, 0.55);
+}
+.legend-swatch.removed {
+  background: transparent;
+  border: 1.5px solid #D8255D;
+  position: relative;
+}
+.legend-swatch.removed::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border: 1.5px dashed #D8255D;
+  border-radius: 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -338,7 +328,7 @@ st.markdown("""
 <div class="brand-row">
   <span class="brand-mark">MEP</span>
   <h1 class="brand-title"><span class="it">Drawing</span> Compare</h1>
-  <div class="brand-version"><span>V</span><span>0.1</span></div>
+  <div class="brand-version"><span>V</span><span>0.2</span></div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -348,13 +338,16 @@ st.markdown("""
 <div class="intro">
   <p class="intro-paragraph">
     Upload an older and newer set of MEP drawings.
-    <span class="it">The tool aligns each sheet, detects pixel-level changes, classifies MEP work apart from architectural background shifts, and marks them on the new set.</span>
+    <span class="it">The tool aligns each sheet, identifies what was added or removed between versions, and marks the new set with yellow highlights and revision clouds.</span>
   </p>
+  <div class="legend">
+    <span class="legend-chip"><span class="legend-swatch added"></span><span class="added" style="color:#9F8500">ADDED</span> &nbsp;new ink in V2 — yellow highlighter</span>
+    <span class="legend-chip"><span class="legend-swatch removed"></span><span class="removed" style="color:#B8311A">REMOVED</span> &nbsp;ink missing from V2 — magenta cloud</span>
+  </div>
   <div class="process">
     <div>01 → IDENTIFY DRAWING NUMBERS &nbsp;·&nbsp; MATCH SHEETS ACROSS SETS</div>
-    <div>02 → ALIGN PAGES &nbsp;·&nbsp; DETECT PIXEL-LEVEL CHANGES</div>
-    <div>03 → CLASSIFY MEP WORK vs. ARCHITECTURAL BACKGROUND</div>
-    <div>04 → EXPORT &nbsp;·&nbsp; ANNOTATED .PDF READY FOR BLUEBEAM / ACROBAT</div>
+    <div>02 → ALIGN PAGES &nbsp;·&nbsp; DETECT <span class="added">ADDED</span> AND <span class="removed">REMOVED</span> CONTENT</div>
+    <div>03 → EXPORT &nbsp;·&nbsp; ANNOTATED .PDF READY FOR BLUEBEAM / ACROBAT</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -371,12 +364,7 @@ with col1:
     </div>
     <p class="section-sub">The earlier issue — multi-sheet vector PDF (V1)</p>
     """, unsafe_allow_html=True)
-    v1_file = st.file_uploader(
-        "Older set (V1)",
-        type=["pdf"],
-        key="v1",
-        label_visibility="collapsed",
-    )
+    v1_file = st.file_uploader("Older set (V1)", type=["pdf"], key="v1", label_visibility="collapsed")
 
 with col2:
     st.markdown("""
@@ -386,27 +374,22 @@ with col2:
     </div>
     <p class="section-sub">The set to mark up — multi-sheet vector PDF (V2)</p>
     """, unsafe_allow_html=True)
-    v2_file = st.file_uploader(
-        "Newer set (V2)",
-        type=["pdf"],
-        key="v2",
-        label_visibility="collapsed",
-    )
+    v2_file = st.file_uploader("Newer set (V2)", type=["pdf"], key="v2", label_visibility="collapsed")
 
 
-# ─── Advanced settings ────────────────────────────────────────────────
+# ─── Settings ─────────────────────────────────────────────────────────
 st.markdown("""
 <div class="section-head" style="margin-top: 32px">
   <span class="step-num">03</span>
   <span class="section-title">Settings</span>
 </div>
-<p class="section-sub">Defaults work for most MEP sets. Adjust if results are off.</p>
+<p class="section-sub">Defaults are tuned for typical 200 DPI vector MEP drawings. Loosen if you're missing real changes; tighten if there's too much noise.</p>
 """, unsafe_allow_html=True)
 
-with st.expander("Title block region — where the drawing number sits on each sheet"):
+with st.expander("Title block region — where the drawing number sits"):
     st.markdown(
-        "Fractions of page width/height. Defaults to the bottom-right corner where MEP title blocks usually live.",
-        help="If sheet matching fails (no drawing numbers found), try widening this region."
+        "Fractions of page width/height. Defaults to the bottom-right corner where MEP title blocks usually live. "
+        "If sheet matching fails (no drawing numbers found), try widening this region."
     )
     tb_col1, tb_col2, tb_col3, tb_col4 = st.columns(4)
     tb_x1 = tb_col1.number_input("Left", value=0.85, min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
@@ -417,63 +400,40 @@ with st.expander("Title block region — where the drawing number sits on each s
 
 with st.expander("Detection sensitivity"):
     sensitivity = st.select_slider(
-        "Foreground/background sensitivity",
+        "Detection level",
         options=[
-            "1 — Strict (thick only)",
-            "2 — Less sensitive",
+            "1 — Strict (only obvious changes)",
+            "2 — Conservative",
             "3 — Default",
-            "4 — More sensitive",
-            "5 — Generous (almost everything)",
+            "4 — Aggressive",
+            "5 — Maximum (will be noisy)",
         ],
         value="3 — Default",
         help=(
-            "Where to draw the line between MEP work (bold magenta) and architectural "
-            "background (grey dashed). Strict catches only thick MEP linework. Generous "
-            "treats most changes as foreground. Default uses an auto-calibrated value "
-            "per drawing set."
+            "Controls how small a change needs to be before it gets marked. "
+            "Strict catches only large, obvious changes. Maximum catches everything "
+            "including fine detail — but may produce a lot of noise."
         ),
     )
-    # Map slider to a multiplier on the auto-calibrated threshold.
-    # Higher multiplier → higher threshold → fewer foreground.
-    SENSITIVITY_MULTIPLIER = {
-        "1 — Strict (thick only)":      2.0,
-        "2 — Less sensitive":           1.4,
-        "3 — Default":                  1.0,
-        "4 — More sensitive":           0.7,
-        "5 — Generous (almost everything)": 0.5,
+    # Map slider to detection parameters. The defaults at step 3 are tuned
+    # for typical MEP drawings; steps 1-2 loosen filtering, 4-5 tighten it.
+    SETTINGS_BY_SENSITIVITY = {
+        "1 — Strict (only obvious changes)":    {"min_area": 4000, "dilation": 30, "threshold": 80},
+        "2 — Conservative":                     {"min_area": 2500, "dilation": 28, "threshold": 70},
+        "3 — Default":                          {"min_area": 1500, "dilation": 25, "threshold": 60},
+        "4 — Aggressive":                       {"min_area": 800,  "dilation": 20, "threshold": 50},
+        "5 — Maximum (will be noisy)":          {"min_area": 300,  "dilation": 15, "threshold": 40},
     }
-    sensitivity_mult = SENSITIVITY_MULTIPLIER[sensitivity]
+    s = SETTINGS_BY_SENSITIVITY[sensitivity]
 
     st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
-    s_col1, s_col2, s_col3 = st.columns(3)
-    dpi = s_col1.number_input("DPI", value=200, min_value=72, max_value=300, step=25,
-                              help="Higher = more sensitive but slower and more memory")
-    pixel_threshold = s_col2.number_input("Pixel threshold", value=40, min_value=5, max_value=200,
-                                          help="Lower = more sensitive to small color differences")
-    dilation_px = s_col3.number_input("Dilation (px)", value=12, min_value=1, max_value=40,
-                                      help="How aggressively to merge nearby changes")
-    min_area_px = st.number_input("Minimum change area (px)", value=200, min_value=20, max_value=5000,
-                                  help="Drop tiny specks below this size")
-    hide_background = st.checkbox(
-        "Hide thin architectural background changes entirely",
-        value=False,
-        help="By default these are shown as grey-dashed boxes. Check to suppress them.",
-    )
+    st.caption(f"Min area: {s['min_area']}px · Dilation: {s['dilation']}px · Pixel threshold: {s['threshold']}")
 
-with st.expander("Markup style"):
-    markup_choice = st.radio(
-        "How to mark changes on the V2 PDF",
-        options=["Boxes only", "Layered (halo ring + highlight + box)"],
-        index=0,
-        help=(
-            "Boxes only: thin magenta outline around each change cluster. Clean, "
-            "matches the standard AEC bounding-box review convention. Best for scanning. "
-            "Layered: adds a thick faded outer ring (halo) for peripheral visibility, "
-            "plus a medium ring on the precise change area. The underlying drawing "
-            "stays visible through all layers."
-        ),
+    st.markdown('<div style="height: 12px"></div>', unsafe_allow_html=True)
+    dpi = st.number_input(
+        "DPI", value=200, min_value=72, max_value=300, step=25,
+        help="Higher = finer detail but slower processing and more memory. 200 is a good default.",
     )
-    markup_mode = MARKUP_MODE_LAYERED if "Layered" in markup_choice else MARKUP_MODE_BOXES
 
 
 # ─── Compare button ───────────────────────────────────────────────────
@@ -481,15 +441,17 @@ st.markdown('<div style="margin-top: 32px"></div>', unsafe_allow_html=True)
 
 ready = v1_file is not None and v2_file is not None
 if not ready:
-    st.markdown('<p style="font-family: var(--mono); font-size: 12px; color: var(--ink-3); letter-spacing: 0.02em;">Awaiting both files…</p>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<p style="font-family: var(--mono); font-size: 12px; color: var(--ink-3); '
+        'letter-spacing: 0.02em;">Awaiting both files…</p>',
+        unsafe_allow_html=True,
+    )
 
 run = st.button("Compare drawings", disabled=not ready, use_container_width=False)
 
 
 # ─── Pipeline ─────────────────────────────────────────────────────────
 if run and v1_file and v2_file:
-    # Persist uploads to temp files so PyMuPDF can open them by path.
     with tempfile.TemporaryDirectory() as tmpdir:
         v1_path = Path(tmpdir) / "v1.pdf"
         v2_path = Path(tmpdir) / "v2.pdf"
@@ -497,7 +459,7 @@ if run and v1_file and v2_file:
         v2_path.write_bytes(v2_file.getvalue())
 
         with st.status("Processing…", expanded=True) as status:
-            st.write(f"Opening PDFs…")
+            st.write("Opening PDFs…")
             v1_doc = open_pdf(v1_path)
             v2_doc = open_pdf(v2_path)
             st.write(f"  V1: {v1_doc.page_count} pages  |  V2: {v2_doc.page_count} pages")
@@ -511,26 +473,29 @@ if run and v1_file and v2_file:
 
             if v1_hits == 0 or v2_hits == 0:
                 status.update(label="No drawing numbers found", state="error")
-                st.error("No drawing numbers detected. Try widening the title block region in Settings.")
+                st.error("No drawing numbers detected. Try widening the title block region.")
                 st.stop()
 
             st.write("Matching sheets…")
             report = match_sheets(v1_ids, v2_ids)
-            st.write(f"  Matched: {len(report.matched)}  |  Added in V2: {len(report.added_in_v2)}  |  Removed from V1: {len(report.removed_from_v1)}")
+            st.write(
+                f"  Matched: {len(report.matched)}  |  "
+                f"Added in V2: {len(report.added_in_v2)}  |  "
+                f"Removed from V1: {len(report.removed_from_v1)}"
+            )
 
             if not report.matched:
                 status.update(label="No matched sheets", state="error")
                 st.error("No sheets matched between the two sets. Drawing numbers may differ.")
                 st.stop()
 
-            # First pass: detect changes on every matched page, collecting
-            # stroke widths so we can compute a global classification threshold.
+            # ─── Per-page comparison ──────────────────────────────────
             st.write(f"Comparing {len(report.matched)} matched pages at {dpi} DPI…")
             progress = st.progress(0.0)
-            page_results = []  # list of (v1_id, v2_id, regions, inlier_ratio, skipped, reason)
+            # Per-page result: (v1_id, v2_id, regions, inlier_ratio, skipped, reason)
+            page_results = []
 
             for i, (v1_id, v2_id) in enumerate(report.matched):
-                dwg = v1_id.drawing_number
                 v1_page = v1_doc[v1_id.page_index]
                 v2_page = v2_doc[v2_id.page_index]
                 v1_rendered = render_page(v1_page, dpi=dpi)
@@ -543,46 +508,48 @@ if run and v1_file and v2_file:
                     regions = detect_changes(
                         v1_rendered.image, reg.aligned_v2,
                         title_block_region=title_block,
-                        pixel_threshold=pixel_threshold,
-                        dilation_px=dilation_px,
-                        min_area_px=min_area_px,
+                        pixel_threshold=s["threshold"],
+                        dilation_px=s["dilation"],
+                        min_area_px=s["min_area"],
                     )
                     page_results.append((v1_id, v2_id, regions, reg.inlier_ratio, False, ""))
 
                 progress.progress((i + 1) / len(report.matched))
 
-            # Auto-calibrate threshold and classify all regions.
-            st.write("Classifying foreground vs background…")
-            all_widths = [r.stroke_width for _, _, regs, _, _, _ in page_results
-                          for r in regs if r.stroke_width > 0]
-            auto = auto_threshold(all_widths) if all_widths else 3.0
-            threshold = auto * sensitivity_mult
-            if sensitivity_mult == 1.0:
-                st.write(f"  Stroke threshold: **{threshold:.2f}px** (auto, from {len(all_widths)} regions)")
-            else:
-                direction = "stricter" if sensitivity_mult > 1.0 else "more generous"
-                st.write(f"  Stroke threshold: **{threshold:.2f}px** "
-                         f"(auto {auto:.2f}px × {sensitivity_mult:.1f} {direction})")
-            for _, _, regs, _, _, _ in page_results:
-                classify_regions(regs, threshold)
+            total_regions = sum(len(r) for _, _, r, _, _, _ in page_results)
+            st.write(f"  Detected {total_regions} regions across {len(page_results)} pages")
 
-            # Annotate.
-            st.write("Annotating V2 PDF…")
-            bg_mode = BACKGROUND_MODE_HIDE if hide_background else BACKGROUND_MODE_DEEMPHASIZE
-            total_fg = 0
-            total_bg = 0
-            for v1_id, v2_id, regs, _, skipped, _ in page_results:
-                if skipped or not regs:
-                    continue
-                v2_page = v2_doc[v2_id.page_index]
-                fg, bg = annotate_page(v2_page, regs, dpi=dpi,
-                                       label_prefix=v1_id.drawing_number,
-                                       background_mode=bg_mode,
-                                       markup_mode=markup_mode)
-                total_fg += fg
-                total_bg += bg
+            # Warn if region count looks suspicious — usually means registration
+            # failed on some pages and we're surfacing residual misalignment.
+            per_page_counts = [(v1_id.drawing_number, len(regs)) for v1_id, _, regs, _, sk, _
+                                in page_results if not sk]
+            noisy_pages = [(d, n) for d, n in per_page_counts if n > 100]
+            if noisy_pages:
+                st.warning(
+                    f"⚠️ {len(noisy_pages)} page(s) detected >100 regions — likely a "
+                    f"registration issue rather than real changes. Check these sheets "
+                    f"manually: {', '.join(d for d, _ in noisy_pages[:5])}"
+                    + (f" and {len(noisy_pages) - 5} more" if len(noisy_pages) > 5 else "")
+                )
+
+            # ─── Annotate ─────────────────────────────────────────────
+            st.write(f"Marking up V2 PDF…")
+            annotate_progress = st.progress(0.0)
+            total_added = 0
+            total_removed = 0
+            for j, (v1_id, v2_id, regs, _, skipped, _) in enumerate(page_results):
+                if not skipped and regs:
+                    v2_page = v2_doc[v2_id.page_index]
+                    added, removed = annotate_page(
+                        v2_page, regs, dpi=dpi,
+                        label_prefix=v1_id.drawing_number,
+                    )
+                    total_added += added
+                    total_removed += removed
+                annotate_progress.progress((j + 1) / len(page_results))
 
             # Save to bytes for download.
+            st.write("Saving…")
             output_buf = io.BytesIO()
             v2_doc.save(output_buf, garbage=4, deflate=True)
             output_bytes = output_buf.getvalue()
@@ -600,11 +567,11 @@ if run and v1_file and v2_file:
         </div>
         """, unsafe_allow_html=True)
 
-        skipped = [pr for pr in page_results if pr[4]]
+        skipped_pages = [pr for pr in page_results if pr[4]]
         rc1, rc2, rc3 = st.columns(3)
-        rc1.metric("Foreground (MEP) regions", total_fg)
-        rc2.metric("Background regions", total_bg)
-        rc3.metric("Pages skipped", len(skipped))
+        rc1.metric("Added regions", total_added, help="New content in V2 — yellow highlighter")
+        rc2.metric("Removed regions", total_removed, help="Content gone from V2 — magenta cloud")
+        rc3.metric("Pages skipped", len(skipped_pages), help="Pages where alignment failed")
 
         if report.added_in_v2:
             added_list = ", ".join(s.drawing_number for s in report.added_in_v2)
@@ -620,19 +587,19 @@ if run and v1_file and v2_file:
             mime="application/pdf",
         )
 
-        # Per-sheet detail table (collapsed by default to keep main view clean).
+        # Per-sheet detail table
         with st.expander("Per-sheet details"):
             import pandas as pd
             rows = []
             for v1_id, v2_id, regs, inlier, skipped, reason in page_results:
-                fg = sum(1 for r in regs if r.is_foreground)
-                bg = sum(1 for r in regs if not r.is_foreground)
+                added_n = sum(1 for r in regs if r.kind == "added")
+                removed_n = sum(1 for r in regs if r.kind == "removed")
                 status_text = "skipped" if skipped else ("changes" if regs else "no changes")
                 rows.append({
                     "Drawing #": v1_id.drawing_number,
                     "Status": status_text,
-                    "Foreground": fg,
-                    "Background": bg,
+                    "Added": added_n,
+                    "Removed": removed_n,
                     "Inlier ratio": f"{inlier:.2f}",
                     "Notes": reason if skipped else "",
                 })

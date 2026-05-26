@@ -1,29 +1,31 @@
 """
-Output annotation: draw change-region markup onto the V2 PDF with a
-visual hierarchy that separates real MEP changes from architectural
-background shifts.
+Output annotation: mark added and removed content on the V2 PDF.
 
-Two markup modes:
-  - BOXES (default): a thin outline around each change cluster. Clean,
-    matches the AEC-industry bounding-box review convention. Best when
-    you primarily scan the marked PDF looking for what to verify.
-  - LAYERED: three layers per cluster — a faint halo outside the
-    cluster (peripheral-vision signal), a translucent fill on the core
-    change area (precision signal), and a thin outline around the
-    padded extent (the scanning signal from BOXES mode). Best when you
-    primarily zoom in to verify specific changes.
+Semantically distinct markup for two semantically distinct events:
 
-Both modes preserve the foreground/background classification: thin
-architectural changes get the dashed grey "context" treatment with no
-fill or halo, regardless of mode.
+  - ADDED (new ink in V2): a yellow translucent highlighter rectangle
+    on the bounding box. Highlight annotations use multiply blending
+    in standard PDF renderers, so the underlying line work stays
+    visible while the new element gets tinted yellow.
 
-We use PyMuPDF rectangle annotations (not baked-in pixels) so markup
-stays editable in Bluebeam/Acrobat — reviewers can delete false
-positives without re-running the tool.
+  - REMOVED (ink in V1 that's gone from V2): a magenta revision cloud
+    around the area where the missing content used to be. Industry-
+    standard convention for "something used to be here." We use PDF's
+    native Border Effect dictionary (/BE with /S /C), which Bluebeam
+    and Acrobat render as proper bumpy revision clouds. Some lighter
+    PDF viewers (preview apps, browser viewers) may show this as a
+    plain rectangle — the markup is correct, the rendering is the
+    viewer's limitation. Open the marked PDF in Bluebeam for the
+    full revision-cloud experience.
 
-Coordinate conversion: regions are in pixel space at render DPI.
-PDF native units are points (1/72 inch).
-   pdf_coord = pixel_coord / (dpi / 72)
+These two markup styles answer different questions:
+  - Yellow highlighter answers "what's new?" by pointing at the
+    actual added element.
+  - Cloud answers "what's missing?" by drawing attention to the
+    empty space where something used to live.
+
+All annotations are PDF-native (not baked-in pixels) so reviewers can
+delete false positives in Bluebeam/Acrobat without re-running.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -31,46 +33,17 @@ import fitz
 from .diff import ChangeRegion
 
 
-# Foreground: MEP work and other heavy linework changes
-FOREGROUND_COLOR_RGB = (1.0, 0.0, 0.8)  # magenta
-FOREGROUND_LINE_WIDTH = 1.5
+# ADDED markup: yellow highlighter
+ADDED_COLOR_RGB = (1.0, 0.92, 0.0)  # bright yellow, slightly warm
 
-# Background: thin architectural / context changes
-BACKGROUND_COLOR_RGB = (0.55, 0.55, 0.55)  # neutral grey
-BACKGROUND_LINE_WIDTH = 0.8
-BACKGROUND_DASH_PATTERN = [4, 4]  # 4-unit dash, 4-unit gap
-
-# Layered-mode tuning. Per-layer styles (color, line width, opacity).
-# Outline-based rather than fill-based because translucent fills render
-# inconsistently across PDF viewers (PyMuPDF, Bluebeam, Acrobat all
-# composite annotation alpha slightly differently). A stack of three
-# outlines at decreasing weights gives a reliable visual hierarchy:
-# the thick faded outer one acts as a halo, the medium one frames the
-# precise change area, and the thin sharp inner one is the conventional
-# bounding box.
-HALO_LINE_WIDTH = 6.0       # thick outer ring
-HALO_OPACITY = 0.18
-HIGHLIGHT_LINE_WIDTH = 2.5  # medium ring on the core change area
-HIGHLIGHT_OPACITY = 0.85
-
-# Halo padding: how far the halo extends beyond the cluster's padded extent.
-# Expressed in PDF points (1/72 inch) for consistent physical extent.
-HALO_PAD_FRACTION = 0.18           # 18% of the cluster's max dimension
-HALO_PAD_MIN_PTS = 6.0             # at least 6pt (~0.08")
-HALO_PAD_MAX_PTS = 54.0            # at most 54pt (~0.75")
-
-# How to handle background regions
-BACKGROUND_MODE_DEEMPHASIZE = "deemphasize"  # default: thin grey dashed
-BACKGROUND_MODE_HIDE = "hide"                # don't annotate at all
-BACKGROUND_MODE_SAME = "same"                # treat the same as foreground (no classification)
-
-# Markup mode
-MARKUP_MODE_BOXES = "boxes"        # outline only (current default behavior)
-MARKUP_MODE_LAYERED = "layered"    # halo + highlight + outline
+# REMOVED markup: magenta revision cloud
+REMOVED_COLOR_RGB = (0.90, 0.05, 0.45)  # rich magenta — high contrast against drawings
+REMOVED_LINE_WIDTH = 1.8
+REMOVED_CLOUD_INTENSITY = 1  # 0 = no cloud, 1 = small bumps, 2 = larger bumps
 
 
 def _pdf_rect_from_pixels(x: int, y: int, w: int, h: int, px_per_pt: float) -> fitz.Rect:
-    """Convert pixel-coord rectangle to a PDF-points fitz.Rect."""
+    """Convert a pixel-coord rectangle to a PDF-points fitz.Rect."""
     return fitz.Rect(
         x / px_per_pt,
         y / px_per_pt,
@@ -79,90 +52,65 @@ def _pdf_rect_from_pixels(x: int, y: int, w: int, h: int, px_per_pt: float) -> f
     )
 
 
-def _draw_foreground_layered(page: fitz.Page, r: ChangeRegion, px_per_pt: float, label: str) -> None:
-    """Draw the three-layer foreground markup: halo ring + highlight ring + sharp outline.
+def _annotate_added(page: fitz.Page, r: ChangeRegion, px_per_pt: float, label: str) -> None:
+    """Draw a yellow highlighter on a region that was added in V2.
 
-    All three layers are stroke-only (no fills) so the underlying drawing
-    stays visible. Layers are drawn back-to-front so they composite:
-      1. Halo: a thick, faded magenta outline outside the padded extent.
-         Provides peripheral-vision signal at full-sheet zoom.
-      2. Highlight: a medium, mostly-opaque outline on the core change
-         extent. Marks more precisely where the change actually is.
-      3. Outline: thin sharp outline on the padded extent. The scanning
-         layer — same as the BOXES mode.
+    Uses PDF's Highlight annotation (multiply blend mode), so the
+    underlying drawing stays visible — yellow over black = black,
+    yellow over white = yellow. Highlight on the *padded* rect rather
+    than the core, so the new element has visual breathing room.
     """
-    # The "core" extent: where the actual change is, before box_margin padding.
-    core_x = r.core_x if r.core_w else r.x
-    core_y = r.core_y if r.core_h else r.y
-    core_w = r.core_w if r.core_w else r.w
-    core_h = r.core_h if r.core_h else r.h
-
-    # Layer 1: halo (thick, faded outer ring).
-    max_dim_pts = max(r.w, r.h) / px_per_pt
-    pad_pts = max(HALO_PAD_MIN_PTS, min(HALO_PAD_MAX_PTS, max_dim_pts * HALO_PAD_FRACTION))
-    halo_rect = fitz.Rect(
-        r.x / px_per_pt - pad_pts,
-        r.y / px_per_pt - pad_pts,
-        (r.x + r.w) / px_per_pt + pad_pts,
-        (r.y + r.h) / px_per_pt + pad_pts,
-    )
-    halo = page.add_rect_annot(halo_rect)
-    halo.set_colors(stroke=FOREGROUND_COLOR_RGB)
-    halo.set_border(width=HALO_LINE_WIDTH)
-    halo.set_opacity(HALO_OPACITY)
-    halo.set_info(title="mep-compare", content=f"{label} (halo)")
-    halo.update()
-
-    # Layer 2: highlight ring (medium weight, mostly opaque, on the core).
-    highlight_rect = _pdf_rect_from_pixels(core_x, core_y, core_w, core_h, px_per_pt)
-    hl = page.add_rect_annot(highlight_rect)
-    hl.set_colors(stroke=FOREGROUND_COLOR_RGB)
-    hl.set_border(width=HIGHLIGHT_LINE_WIDTH)
-    hl.set_opacity(HIGHLIGHT_OPACITY)
-    hl.set_info(title="mep-compare", content=f"{label} (highlight)")
-    hl.update()
-
-    # Layer 3: sharp outline on the padded extent — the conventional box.
-    outline_rect = _pdf_rect_from_pixels(r.x, r.y, r.w, r.h, px_per_pt)
-    outline = page.add_rect_annot(outline_rect)
-    outline.set_colors(stroke=FOREGROUND_COLOR_RGB)
-    outline.set_border(width=FOREGROUND_LINE_WIDTH)
-    outline.set_opacity(1.0)
-    outline.set_info(
-        title="mep-compare",
-        content=f"{label} [MEP] area={r.area}px  stroke≈{r.stroke_width:.1f}px",
-    )
-    outline.update()
-
-
-def _draw_foreground_box(page: fitz.Page, r: ChangeRegion, px_per_pt: float, label: str) -> None:
-    """Draw the box-only foreground markup: outline rectangle only."""
-    outline_rect = _pdf_rect_from_pixels(r.x, r.y, r.w, r.h, px_per_pt)
-    annot = page.add_rect_annot(outline_rect)
-    annot.set_colors(stroke=FOREGROUND_COLOR_RGB)
-    annot.set_border(width=FOREGROUND_LINE_WIDTH)
+    rect = _pdf_rect_from_pixels(r.x, r.y, r.w, r.h, px_per_pt)
+    # add_highlight_annot accepts either a Rect or a list of Quads. A
+    # Rect produces a single-quad highlight covering that rectangle.
+    annot = page.add_highlight_annot(rect)
+    annot.set_colors(stroke=ADDED_COLOR_RGB)
     annot.set_info(
         title="mep-compare",
-        content=f"{label} [MEP] area={r.area}px  stroke≈{r.stroke_width:.1f}px",
+        content=f"{label} [ADDED]  area={r.area}px",
     )
     annot.update()
 
 
-def _draw_background(page: fitz.Page, r: ChangeRegion, px_per_pt: float, label: str) -> None:
-    """Draw the background (de-emphasized) markup: thin grey dashed outline only.
+def _annotate_removed(page: fitz.Page, r: ChangeRegion, px_per_pt: float, label: str) -> None:
+    """Draw a magenta revision cloud around a region where content
+    was removed from V2 (existed in V1 but is gone now).
 
-    Backgrounds get the same treatment in both markup modes — there's no
-    point highlighting architectural shifts more strongly. The dashed
-    grey outline is enough to acknowledge they exist without competing
-    for attention with the real MEP changes.
+    Uses PDF's native Border Effect "Cloudy" style, supported by
+    Bluebeam and Acrobat. If the running PyMuPDF version doesn't
+    support the cloud parameter, falls back to a solid magenta
+    rectangle outline — visually distinct from yellow highlight,
+    just without the bumpy edge.
     """
-    outline_rect = _pdf_rect_from_pixels(r.x, r.y, r.w, r.h, px_per_pt)
-    annot = page.add_rect_annot(outline_rect)
-    annot.set_colors(stroke=BACKGROUND_COLOR_RGB)
-    annot.set_border(width=BACKGROUND_LINE_WIDTH, dashes=BACKGROUND_DASH_PATTERN)
+    rect = _pdf_rect_from_pixels(r.x, r.y, r.w, r.h, px_per_pt)
+    annot = page.add_rect_annot(rect)
+    annot.set_colors(stroke=REMOVED_COLOR_RGB)
+
+    # Try the cloud border effect. Older PyMuPDF API exposes this via
+    # the `clouds` keyword on set_border; newer versions accept a
+    # `border` dict with PDF-spec keys. We try both, then plain.
+    cloud_applied = False
+    try:
+        annot.set_border(width=REMOVED_LINE_WIDTH, clouds=REMOVED_CLOUD_INTENSITY)
+        cloud_applied = True
+    except (TypeError, ValueError):
+        try:
+            annot.set_border({
+                "width": REMOVED_LINE_WIDTH,
+                "style": "C",
+                "clouds": REMOVED_CLOUD_INTENSITY,
+            })
+            cloud_applied = True
+        except (TypeError, ValueError, KeyError):
+            annot.set_border(width=REMOVED_LINE_WIDTH)
+
     annot.set_info(
         title="mep-compare",
-        content=f"{label} [bg] area={r.area}px  stroke≈{r.stroke_width:.1f}px",
+        content=(
+            f"{label} [REMOVED]  area={r.area}px"
+            if cloud_applied
+            else f"{label} [REMOVED]  area={r.area}px  (cloud-effect unsupported, plain outline)"
+        ),
     )
     annot.update()
 
@@ -172,31 +120,24 @@ def annotate_page(
     regions: list[ChangeRegion],
     dpi: int,
     label_prefix: str = "",
-    background_mode: str = BACKGROUND_MODE_DEEMPHASIZE,
-    markup_mode: str = MARKUP_MODE_BOXES,
 ) -> tuple[int, int]:
-    """Add annotations for each change region. Returns (foreground_count,
-    background_count) actually drawn."""
+    """Annotate one page with all its change regions. Returns
+    (added_count, removed_count) for the summary panel."""
     px_per_pt = dpi / 72.0
-    fg_count = 0
-    bg_count = 0
+    added_count = 0
+    removed_count = 0
 
     for i, r in enumerate(regions, start=1):
         label = f"{label_prefix}#{i}" if label_prefix else f"Change #{i}"
+        if r.kind == "added":
+            _annotate_added(page, r, px_per_pt, label)
+            added_count += 1
+        elif r.kind == "removed":
+            _annotate_removed(page, r, px_per_pt, label)
+            removed_count += 1
+        # Unknown kinds are silently skipped — future-proofing.
 
-        if r.is_foreground or background_mode == BACKGROUND_MODE_SAME:
-            if markup_mode == MARKUP_MODE_LAYERED:
-                _draw_foreground_layered(page, r, px_per_pt, label)
-            else:
-                _draw_foreground_box(page, r, px_per_pt, label)
-            fg_count += 1
-        else:
-            if background_mode == BACKGROUND_MODE_HIDE:
-                continue
-            _draw_background(page, r, px_per_pt, label)
-            bg_count += 1
-
-    return (fg_count, bg_count)
+    return (added_count, removed_count)
 
 
 def save_annotated(doc: fitz.Document, output_path: str | Path) -> None:
